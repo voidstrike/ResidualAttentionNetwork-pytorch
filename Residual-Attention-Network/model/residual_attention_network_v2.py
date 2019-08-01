@@ -6,7 +6,8 @@ from torch.autograd import Variable
 import numpy as np
 from .basic_layers import ResidualBlock
 from .attention_module import AttentionModule_stage1, AttentionModule_stage2, AttentionModule_stage3, AttentionModule_stage0
-from .attention_module import AttentionModule_stage1_cifar, AttentionModule_stage2_cifar, AttentionModule_stage3_cifar
+# from .attention_module import AttentionModule_stage1_cifar, AttentionModule_stage2_cifar, AttentionModule_stage3_cifar
+from .attention_module_v2 import AttentionModule_stage1_cifar, AttentionModule_stage2_cifar, AttentionModule_stage3_cifar
 
 
 class ResidualAttentionModel_448input(nn.Module):
@@ -253,19 +254,26 @@ class ResidualAttentionModel_92_32input_update(nn.Module):
         self.fc = nn.Linear(1024,10)
 
     def forward(self, x):
+        attn_map_list = dict()
         out = self.conv1(x)
         # out = self.mpool1(out)
         # print(out.data)
         out = self.residual_block1(out)
-        out = self.attention_module1(out)
+        out, attn_map = self.attention_module1(out)
+        attn_map_list['am1'] = attn_map
         out = self.residual_block2(out)
-        out = self.attention_module2(out)
-        out = self.attention_module2_2(out)
+        out, attn_map = self.attention_module2(out)
+        attn_map_list['am2-1'] = attn_map
+        out, attn_map = self.attention_module2_2(out)
+        attn_map_list['am2-2'] = attn_map
         out = self.residual_block3(out)
         # print(out.data)
-        out = self.attention_module3(out)
-        out = self.attention_module3_2(out)
-        out = self.attention_module3_3(out)
+        out, attn_map = self.attention_module3(out)
+        attn_map_list['am3-1'] = attn_map
+        out, attn_map = self.attention_module3_2(out)
+        attn_map_list['am3-2'] = attn_map
+        out, attn_map = self.attention_module3_3(out)
+        attn_map_list['am3-3'] = attn_map
         out = self.residual_block4(out)
         out = self.residual_block5(out)
         out = self.residual_block6(out)
@@ -273,27 +281,4 @@ class ResidualAttentionModel_92_32input_update(nn.Module):
         out = out.view(out.size(0), -1)
         out = self.fc(out)
 
-        return out
-
-    def multiple_forward(self, x):
-        res = dict()
-        out = self.conv1(x)
-
-        out = self.residual_block1(out)
-        out = self.attention_module1(out)
-        out = self.residual_block2(out)
-        out = self.attention_module2(out)
-        out = self.attention_module2_2(out)
-        out = self.residual_block3(out)
-
-        out = self.attention_module3(out)
-        out = self.attention_module3_2(out)
-        out = self.attention_module3_3(out)
-        out = self.residual_block4(out)
-        out = self.residual_block5(out)
-        out = self.residual_block6(out)
-        out = self.mpool2(out)
-        out = out.view(out.size(0), -1)
-        out = self.fc(out)
-
-        return out
+        return out, attn_map_list
