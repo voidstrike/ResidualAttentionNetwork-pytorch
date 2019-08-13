@@ -12,62 +12,229 @@ import time
 # from model.residual_attention_network_pre import ResidualAttentionModel
 # based https://github.com/liudaizong/Residual-Attention-Network
 from model.residual_attention_network import ResidualAttentionModel_92_32input_update as ResidualAttentionModel
-from art.attacks import DeepFool, BasicIterativeMethod, SaliencyMapMethod, CarliniL2Method, CarliniLInfMethod
+from art.attacks import DeepFool, BasicIterativeMethod, CarliniL2Method, CarliniLInfMethod
+from art.attacks import FastGradientMethod, SaliencyMapMethod
 from art.classifiers import PyTorchClassifier
 
+from model.AttnVGG import CBAM_VGG16, LTPA_VGG16, RAM_VGG16, RAM_VGG16_v2
+from model.AttnVGG import CBAM_VGG19, LTPA_VGG19, RAM_VGG19, RAM_VGG19_v2
+from model.AttnResNet_v2 import CBAM_ResidualNet, RAM_ResNet18, LTPA_ResNet18, RAM_ResNet18_v2
+
 import argparse
+import math
+from PIL import Image
+
+# Global Variables Area
 
 model_file = 'model_92_sgd.pkl'
 _classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
 
+# Image Preprocessing
+_transform = transforms.Compose([
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomCrop((32, 32), padding=4),
+    transforms.ToTensor()
+])
 
-def register_logger():
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter('[%(levelname)s] % (message)s')
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-
-    return logger
+_test_transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465),
+                         (0.2023, 0.1994, 0.2010)),
+])
 
 
-def fgsm_convert(x_input, y_input, model, criterion):
-    eps = list()
-    b, c, h, w = x_input.size()
+class CIFAR10_Dataset(Dataset):
+    def __init__(self, config, train=True, target_transform=None):
+        self.target_transform = target_transform
+        self.train = train
 
-    for _ in range(b):
-        while True:
-            rand_num = abs(np.random.normal(loc=.0, scale=8, size=None))
-            if rand_num <= 16:
-                eps.append(float(rand_num) / 255.0)
-                break
-
-    for idx in range(b):
-        x = Variable(x_input[idx].clone().expand(1, 3, 32, 32).cuda(), requires_grad=True)
-        y = Variable(y_input[idx].clone().expand(1).cuda(), requires_grad=False)
-
-        model.zero_grad()
-        h = model(x)
-        loss = criterion(h, y)
-
-        if x.grad is not None:
-            x.grad.data.fill_(0)
-
-        loss.backward()
-        # print(x.grad)
-
-        x_adv = x.detach() - eps[idx] * torch.sign(x.grad)
-        x_adv = torch.clamp(x_adv, 0, 1)
-
-        if idx == 0:
-            adv_all_x = x_adv.clone()
-            adv_all_y = y.clone()
+        if self.train:
+            self.train_data, self.train_labels = get_data(config, train)
+            self.train_data = self.train_data.reshape((self.train_data.shape[0], 3, 32, 32))
+            self.train_data = self.train_data.transpose((0, 2, 3, 1))
+            self.train_data = MF_Layer(self.train_data, config, train=True)
         else:
-            adv_all_x = torch.cat((adv_all_x, x_adv), 0)
-            adv_all_y = torch.cat((adv_all_y, y), 0)
+            self.test_data, self.test_labels = get_data(config)
+            self.test_data = self.test_data.reshape((self.test_data.shape[0], 3, 32, 32))
+            self.test_data = self.test_data.transpose((0, 2, 3, 1))
+            self.test_data = MF_Layer(self.test_data, config, train=False)
 
-    return adv_all_x, adv_all_y
+        print(type(self.test_data))
+
+    def __getitem__(self, index):
+        if self.train:
+            img, label = self.train_data[index], self.train_labels[index]
+        else:
+            img, label = self.test_data[index], self.test_labels[index]
+
+        img = Image.fromarray(img)
+
+        if self.train:
+            img = transform_train(img)
+        else:
+            img = transform_test(img)
+
+        if self.target_transform is not None:
+            label = self.target_transform(label)
+
+        return img, label
+
+    def __len__(self):
+        if self.train:
+            return len(self.train_data)
+        else:
+            return len(self.test_data)
+
+
+class CIFAR10_PH(Dataset):
+    def __init__(self, features, labels, feature_tfs, label_tfs, conf):
+        self.test_data, self.test_labels = features, labels
+        self.ftfs = feature_tfs
+        self.ltfs = label_tfs
+        self.test_data = MF_Layer(self.test_data, conf, train=False)
+
+    def __getitem__(self, index):
+        img = self.test_data[index]
+        label = self.test_labels[index]
+
+        img = Image.fromarray(img)
+        img = self.ftfs(img)
+
+        if self.ltfs is not None:
+            label = self.ltfs(label)
+
+        return img, label
+
+    def __len__(self):
+        return len(self.test_data)
+
+
+class UnNormalize(object):
+    def __init__(self, mean, std):
+        self.mean = mean
+        self.std = std
+
+    def __call__(self, tensor):
+        """
+        Args:
+            tensor (Tensor): Tensor image of size (C, H, W) to be normalized.
+        Returns:
+            Tensor: Normalized image.
+        """
+
+        tensor[:, 0, :, :] = tensor[:, 0, :, :].mul(self.std[0]).add_(self.mean[0])
+        tensor[:, 1, :, :] = tensor[:, 1, :, :].mul(self.std[1]).add_(self.mean[1])
+        tensor[:, 2, :, :] = tensor[:, 2, :, :].mul(self.std[2]).add_(self.mean[2])
+
+        return tensor
+
+# ------------------------------------------------------------------------------------------------
+
+
+def usvt(img, maskp, config):
+    """universal singular value thresholding (USVT) approach.
+    Data matrix is scaled between [-1, 1] before matrix estimation (and rescaled back after ME)
+    """
+    h, w, c = img.shape
+    img = img.astype('float64') * 2 / 255 - 1
+
+    if config.me_channel == 'concat':
+        img = img.transpose(2, 0, 1)
+        img = np.concatenate((np.concatenate((img[0], img[1]), axis=1), img[2]), axis=1)
+        mask = np.random.binomial(1, maskp, h * w * c).reshape(h, w * c)
+        p_obs = len(mask[mask == 1]) / (h * w * c)
+
+        u, sigma, v = np.linalg.svd(img * mask)
+        S = np.zeros((h, h))
+        for j in range(int(config.svdprob * h)):
+            S[j][j] = sigma[j]
+        S = np.concatenate((S, np.zeros((h, w*(c-1)))), axis=1)
+
+        W = np.dot(np.dot(u, S), v) / p_obs
+        W[W < -1] = -1
+        W[W > 1] = 1
+        est_matrix = (W + 1) * 255 / 2
+        outputs = np.zeros((h, w, c))
+        for channel in range(c):
+            outputs[:, :, channel] = est_matrix[:, channel * w:(channel + 1) * w]
+    else:
+        mask = np.random.binomial(1, maskp, h * w).reshape(h, w)
+        p_obs = len(mask[mask == 1]) / (h * w)
+
+        outputs = np.zeros((h, w, c))
+        for channel in range(c):
+            u, sigma, v = np.linalg.svd(img[:, :, channel] * mask)
+            S = np.zeros((h, h))
+            sigma = np.concatenate((sigma, np.zeros(h - len(sigma))), axis=0)
+            for j in range(int(config.svdprob * h)):
+                S[j][j] = sigma[j]
+
+            W = np.dot(np.dot(u, S), v) / p_obs
+            W[W < -1] = -1
+            W[W > 1] = 1
+            outputs[:, :, channel] = (W + 1) * 255 / 2
+
+    return outputs
+
+
+def unpickle(file):
+    import pickle
+    with open(file, 'rb') as fo:
+        dict = pickle.load(fo, encoding='bytes')
+    return dict
+
+
+def get_data(config, train=False):
+    data = None
+    labels = None
+    if train:
+        for i in range(1, 6):
+            batch = unpickle(config.data_dir + 'cifar-10-batches-py/data_batch_' + str(i))
+            if i == 1:
+                data = batch[b'data']
+            else:
+                data = np.concatenate([data, batch[b'data']])
+            if i == 1:
+                labels = batch[b'labels']
+            else:
+                labels = np.concatenate([labels, batch[b'labels']])
+
+        data_tmp = data
+        labels_tmp = labels
+        # repeat n times for different masks
+        for i in range(config.mask_num - 1):
+            data = np.concatenate([data, data_tmp])
+            labels = np.concatenate([labels, labels_tmp])
+    else:
+        batch = unpickle(config.data_dir + 'cifar-10-batches-py/test_batch')
+        data = batch[b'data']
+        labels = batch[b'labels']
+    return data, labels
+
+
+def target_transform(label):
+    label = np.array(label)
+    target = torch.from_numpy(label).long()
+    return target
+
+
+# MF pre-processing
+def MF_Layer(train_data, config, train=True):
+    if train:
+        for i in range(train_data.shape[0]):
+            maskp = config.startp + math.ceil((i + 1) / 50000) * (config.endp - config.startp) / config.mask_num
+            train_data[i] = globals()[config.me_type](train_data[i], maskp, config)
+            # Bar visualization
+            # progress_bar(i, train_data.shape[0], ' | Training data')
+
+    else:
+        for i in range(train_data.shape[0]):
+            maskp = (config.startp + config.endp) / 2
+            train_data[i] = globals()[config.me_type](train_data[i], maskp, config)
+            # Bar visualization
+            # progress_bar(i, train_data.shape[0], ' | Testing data')
+
+    return train_data
 
 
 def general_test(model, optimizer, input_shape, nb_classes, test_loader, method, btrain=False,
@@ -118,39 +285,46 @@ def general_test(model, optimizer, input_shape, nb_classes, test_loader, method,
     return correct / total
 
 
-def fgsm_test(model, test_loader, btrain=False, model_file='last_model_92_sgd.pkl'):
+def general_test_v2(model, optimizer, input_shape, nb_classes, test_loader, method, conf, btrain=False,
+                  model_file='last_model_92_sgd.pkl'):
     global _classes
     if not btrain:
-        model.load_state_dict(torch.load(model_file))
+        checked_state = torch.load(model_file)['state_dict']
+        model.load_state_dict(checked_state)
     model.eval()
 
-    correct = 0
-    total = 0
-    criterion = nn.CrossEntropyLoss()
-    #
-    class_correct = list(0. for _ in range(10))
-    class_total = list(0. for _ in range(10))
+    loss = nn.CrossEntropyLoss()
+    warped_model = PyTorchClassifier(model, loss, optimizer, input_shape, nb_classes, clip_values=(.0, 1.))
+    if method == 'Deepfool':
+        adv_crafter = DeepFool(warped_model)
+    elif method == 'BIM':
+        adv_crafter = BasicIterativeMethod(warped_model, batch_size=32)
+    elif method == 'JSMA':
+        adv_crafter = SaliencyMapMethod(warped_model, batch_size=32)
+    elif method == 'CW2':
+        adv_crafter = CarliniL2Method(warped_model, batch_size=32)
+    elif method == 'CWI':
+        adv_crafter = CarliniLInfMethod(warped_model, batch_size=32)
+    elif method == 'FGSM':
+        adv_crafter = FastGradientMethod(warped_model, batch_size=32)
 
-    for images, labels in test_loader:
-        images, labels = fgsm_convert(images, labels, model, criterion)
+    correct, total = 0, 0
+
+    adv_dataset = adv_generalization(test_loader, adv_crafter, conf)
+    temp_loader = DataLoader(dataset=adv_dataset, batch_size=32, shuffle=False, drop_last=True)
+    # temp_loader = test_loader
+
+    for images, labels in temp_loader:
         images = Variable(images.cuda())
         labels = Variable(labels.cuda())
+
         outputs = model(images)
         _, predicted = torch.max(outputs.data, 1)
         total += labels.size(0)
         correct += (predicted == labels.data).sum()
-        #
-        c = (predicted == labels.data).squeeze()
-        for i in range(20):
-            label = labels.data[i]
-            class_correct[label] += c[i]
-            class_total[label] += 1
 
     print('Accuracy of the model on the test images: %d %%' % (100 * float(correct) / total))
     print('Accuracy of the model on the test images:', float(correct) / total)
-    for i in range(10):
-        print('Accuracy of %5s : %2d %%' % (
-            _classes[i], 100 * class_correct[i] / class_total[i]))
     return correct / total
 
 
@@ -158,14 +332,14 @@ def fgsm_test(model, test_loader, btrain=False, model_file='last_model_92_sgd.pk
 def test(model, test_loader, btrain=False, model_file='last_model_92_sgd.pkl'):
     global _classes
     if not btrain:
-        model.load_state_dict(torch.load(model_file))
+        model.load_state_dict(torch.load(model_file)['state_dict'])
     model.eval()
 
     correct = 0
     total = 0
     #
-    class_correct = list(0. for i in range(10))
-    class_total = list(0. for i in range(10))
+    class_correct = list(0. for _ in range(10))
+    class_total = list(0. for _ in range(10))
 
     for images, labels in test_loader:
         images = Variable(images.cuda())
@@ -191,33 +365,83 @@ def test(model, test_loader, btrain=False, model_file='last_model_92_sgd.pkl'):
     return correct / total
 
 
-# Image Preprocessing
-_transform = transforms.Compose([
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomCrop((32, 32), padding=4),   #left, top, right, bottom
-    # transforms.Scale(224),
-    transforms.ToTensor()
-])
+def adv_generalization(tgt_dl, adv, conf):
+    fout, lout = None, None
+    unnorm = UnNormalize(mean=(0.4914, 0.4822, 0.4465), std=(0.2023, 0.1994, 0.2010))
+    # c_mean = torch.tensor([0.4914, 0.4822, 0.4465], dtype=torch.float32)
+    # c_std = torch.tensor([0.2023, 0.1994, 0.2010], dtype=torch.float32)
+    # unnorm = transforms.Normalize((-c_mean / c_std).tolist(), (1.0 / c_std).tolist())
 
-_test_transform = transforms.Compose([
-    transforms.ToTensor()
-])
+    for batch_idx, (images, labels) in enumerate(tgt_dl):
+        images = adv.generate(images.numpy())
+        images = torch.from_numpy(images)
+        images = unnorm(images) * 255.0
+
+        if fout is None:
+            fout = images
+        else:
+            fout = torch.cat((fout, images), dim=0)
+
+        if lout is None:
+            lout = labels
+        else:
+            lout = torch.cat((lout, labels), dim=0)
+
+    global _test_transform
+    res_data = CIFAR10_PH(fout.numpy().astype('uint8').transpose(0, 2, 3, 1), lout.numpy(),
+                          _test_transform, target_transform, conf)
+
+    return res_data
 
 
 def main(opt):
+    global _transform, _test_transform
     # Load dataset
     train_dataset = datasets.CIFAR10(root='./data/', train=True, transform=_transform, download=True)
     test_dataset = datasets.CIFAR10(root='./data/', train=False, transform=_test_transform)
+    # test_dataset = CIFAR10_Dataset(opt, False, target_transform)
 
     # Get Data Loader
     train_loader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=64, shuffle=True, num_workers=8)
-    test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=20, shuffle=False, drop_last=True)
+    test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=32, shuffle=False, drop_last=True)
 
-    model = ResidualAttentionModel().cuda()
-    print(model)
+    if opt.model == 'cbam-vgg16':
+        model = CBAM_VGG16()
+    elif opt.model == 'cbam-vgg19':
+        model = CBAM_VGG19()
+    elif opt.model == 'ram-vgg16':
+        model = RAM_VGG16()
+    elif opt.model == 'ram-vgg19':
+        model = RAM_VGG19()
+    elif opt.model == 'ram-vgg16_v2':
+        model = RAM_VGG16_v2()
+    elif opt.model == 'ram_vgg19_v2':
+        model = RAM_VGG19_v2()
+    elif opt.model == 'ltpa-vgg16':
+        model = LTPA_VGG16()
+    elif opt.model == 'ltpa-vgg19':
+        model = LTPA_VGG19()
+    elif opt.model == 'cbam-resnet':
+        model = CBAM_ResidualNet("CIFAR10", 18, 10)
+    elif opt.model == 'ram-resnet':
+        model = RAM_ResNet18()
+    elif opt.model == 'ram-resnet-v2':
+        model = RAM_ResNet18_v2()
+    elif opt.model == 'ltpa-resnet':
+        model = LTPA_ResNet18()
+    elif opt.model == 'vgg16':
+        model = models.vgg16(pretrained=False)
+    elif opt.model == 'vgg19':
+        model = models.vgg19(pretrained=False)
+    elif opt.model == 'resnet':
+        model = models.resnet18(pretrained=False)
+    else:
+        raise Exception('Unsupported Model')
+
+    # print(model)
+    model = model.cuda()
 
     lr = opt.lr
-
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9, nesterov=True, weight_decay=0.0001)
 
@@ -269,19 +493,25 @@ def main(opt):
 
     else:
         if opt.method == 'None':
-            test(model, test_loader, btrain=False)
+            test(model, test_loader, btrain=False, model_file=opt.model_path)
         elif opt.method == 'fgsm':
-            fgsm_test(model, test_loader, btrain=False)
+            general_test_v2(model, optimizer, (32, 3, 32, 32), 10, test_loader, 'FGSM',
+                            conf=opt, btrain=False, model_file=opt.model_path)
         elif opt.method == 'Deepfool':
-            general_test(model, optimizer, (20, 3, 32, 32), 10, test_loader, 'Deepfool', btrain=False)
+            general_test_v2(model, optimizer, (32, 3, 32, 32), 10, test_loader, 'Deepfool',
+                            conf=opt, btrain=False, model_file=opt.model_path)
         elif opt.method == 'BIM':
-            general_test(model, optimizer, (20, 3, 32, 32), 10, test_loader, 'BIM', btrain=False)
+            general_test_v2(model, optimizer, (32, 3, 32, 32), 10, test_loader, 'BIM',
+                            conf=opt, btrain=False, model_file=opt.model_path)
         elif opt.method == 'JSMA':
-            general_test(model, optimizer, (20, 3, 32, 32), 10, test_loader, 'JSMA', btrain=False)
+            general_test_v2(model, optimizer, (32, 3, 32, 32), 10, test_loader, 'JSMA',
+                            conf=opt, btrain=False, model_file=opt.model_path)
         elif opt.method == 'CW2':
-            general_test(model, optimizer, (20, 3, 32, 32), 10, test_loader, 'CW2', btrain=False)
+            general_test_v2(model, optimizer, (32, 3, 32, 32), 10, test_loader, 'CW2',
+                            conf=opt, btrain=False, model_file=opt.model_path)
         elif opt.method == 'CWI':
-            general_test(model, optimizer, (20, 3, 32, 32), 10, test_loader, 'CWI', btrain=False)
+            general_test_v2(model, optimizer, (32, 3, 32, 32), 10, test_loader, 'CWI',
+                            conf=opt, btrain=False, model_file=opt.model_path)
         else:
             raise Exception("Unsupported Attack Method")
     pass
@@ -289,11 +519,46 @@ def main(opt):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+
     parser.add_argument('--method', type=str, default='None', help='None|fgsm|BIM|Deepfool|JSMA|CW2|CWI')
+    parser.add_argument('--model', type=str, required=True)
+    parser.add_argument('--model_path', type=str, required=True)
+    parser.add_argument('--data_dir', default='data/', help='data path')
+
+    # Default Training Setting, placeholder for some parameters only
     parser.add_argument('--lr', type=float, default=.1)
     parser.add_argument('--train', type=bool, default=False)
     parser.add_argument('--pretrain', type=bool, default=False)
 
-    opt = parser.parse_args()
+    # Default ME setting, borrow from train_ori
+    parser.add_argument('--startp', type=float, default=0.8)
+    parser.add_argument('--endp', type=float, default=1)
+    parser.add_argument('--me-type', type=str, default='usvt')
+    parser.add_argument('--me-channel', type=str, default='concat')
+    parser.add_argument('--svdprob', type=float, default=0.8, help='USVT hyper-param (default: 0.8)')
+    parser.add_argument('--no-augment', dest='augment', action='store_false')
 
-    main(opt)
+    c_opt = parser.parse_args()
+
+    if c_opt.augment:
+        transform_train = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465),
+                                 (0.2023, 0.1994, 0.2010)),
+        ])
+    else:
+        transform_train = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465),
+                                 (0.2023, 0.1994, 0.2010)),
+        ])
+
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465),
+                             (0.2023, 0.1994, 0.2010)),
+    ])
+
+    main(c_opt)
