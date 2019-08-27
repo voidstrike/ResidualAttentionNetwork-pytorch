@@ -6,36 +6,33 @@ import sys
 import random
 import math
 from PIL import Image
-from cvxpy import *
-from fancyimpute import SoftImpute, BiScaler
+# from cvxpy import *
 
 import torch
+import foolbox
 import torch.nn as nn
 import torch.utils.data as Data
 import torch.nn.functional as F
-import torchvision.models as M
+import torchvision
 import torchvision.transforms as transforms
+# from tools import progress_bar
 
-from model.AttnVGG import CBAM_VGG16, LTPA_VGG16, RAM_VGG16, RAM_VGG16_v2, RAW_VGG16
-from model.AttnVGG import CBAM_VGG19, LTPA_VGG19, RAM_VGG19, RAM_VGG19_v2
-from model.AttnResNet_v2 import CBAM_ResidualNet, RAM_ResNet18, LTPA_ResNet18, RAM_ResNet18_v2
-
-from tools import progress_bar
+from model.AttnVGG import RAM_VGG16, RAM_VGG16_v2
 
 
 parser = argparse.ArgumentParser()
 # Directory
 parser.add_argument('--data-dir', default='./data/', help='data path')
-parser.add_argument('--save-dir', default='./checkpoint_v2/', help='save path')
+parser.add_argument('--save-dir', default='./checkpoint/', help='save path')
 # Hyper-parameters
-parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
+parser.add_argument('--lr', type=float, default=0.005, help='learning rate')
 parser.add_argument('--mu', type=float, default=1, help='Nuclear Norm hyper-param (default: 1)')
 parser.add_argument('--svdprob', type=float, default=0.8, help='USVT hyper-param (default: 0.8)')
 parser.add_argument('--mask-num', type=int, default=2, help='number of sampled masks (default: 3)')
 parser.add_argument('--maskp', type=float, default=0.5, help='probability of mask sampling (default: 0.5)')
-parser.add_argument('--startp', type=float, default=0.5, help='start probability of mask sampling (default: 0.5)')
-parser.add_argument('--endp', type=float, default=0.5, help='end probability of mask sampling (default: 0.5)')
-parser.add_argument('--batch-size', type=int, default=256, help='batch size (default: 256)')
+parser.add_argument('--startp', type=float, default=0.4, help='start probability of mask sampling (default: 0.5)')
+parser.add_argument('--endp', type=float, default=0.6, help='end probability of mask sampling (default: 0.5)')
+parser.add_argument('--batch_size', type=int, default=256, help='batch size (default: 256)')
 parser.add_argument('--epoch', type=int, default=101, help='total epochs (default: 200)')
 parser.add_argument('--num_ckpt_steps', type=int, default=10, help='save checkpoint steps (default: 10)')
 parser.add_argument('--attack', type=bool, default=True,
@@ -57,10 +54,9 @@ parser.add_argument('--name', type=str, default='advtrain', help='name of the ru
 
 args = parser.parse_args()
 
-
 # Checkpoint related
 START_EPOCH = 0
-
+batch_size = args.batch_size
 # Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -71,6 +67,8 @@ config = {
     'random_start': True,
     'loss_func': 'xent',
 }
+
+globe_train = False
 
 # Normalization param
 mean = np.array([0.4914, 0.4822, 0.4465]).reshape((3, 1, 1))
@@ -119,7 +117,6 @@ def target_transform(label):
 
 
 class CIFAR10_Dataset(Data.Dataset):
-
     def __init__(self, train=True, target_transform=None):
         self.target_transform = target_transform
         self.train = train
@@ -146,9 +143,9 @@ class CIFAR10_Dataset(Data.Dataset):
             img = transform_test(img)
 
         if self.target_transform is not None:
-            label = self.target_transform(label)
+            target = self.target_transform(label)
 
-        return img, label
+        return img, target
 
     def __len__(self):
         if self.train:
@@ -225,7 +222,7 @@ class RecosNet(nn.Module):
         self.model = model
 
     def forward(self, input):
-        x = globals()[args.me_type].apply(input)
+        x = globals()['usvt'].apply(input)
         return self.model(x)
 
 
@@ -250,7 +247,7 @@ class AttackPGD(nn.Module):
             x.requires_grad_()
             with torch.enable_grad():
                 logits = self.model(x)
-                loss = F.cross_entropy(logits, targets, reduction='sum')
+                loss = F.cross_entropy(logits, targets, size_average=False)
             grad = torch.autograd.grad(loss, [x])[0]
             # print(grad)
             x = x.detach() + self.step_size * torch.sign(grad.detach())
@@ -260,7 +257,7 @@ class AttackPGD(nn.Module):
         return self.model(x), x
 
 
-def train(epoch, train_loader):
+def train(epoch, net, optimizer, criterion, train_loader):
     print('\nEpoch: %d' % epoch)
     net.train()
     global globe_train, mask_train_cnt
@@ -285,14 +282,14 @@ def train(epoch, train_loader):
         correct += pred_idx.eq(targets.data).cpu().sum().float()
 
         # Bar visualization
-        progress_bar(batch_idx, len(train_loader),
+        print(batch_idx, len(train_loader),
                      'Loss: %.3f | Acc: %.3f%% (%d/%d)'
                      % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
 
     return train_loss / batch_idx, 100. * correct / total
 
 
-def test(epoch, test_loader):
+def test(epoch, net, criterion, test_loader):
     global globe_train
     globe_train = False
     net.eval()
@@ -312,17 +309,17 @@ def test(epoch, test_loader):
             correct += pred_idx.eq(targets.data).cpu().sum().float()
 
             # Bar visualization
-            progress_bar(batch_idx, len(test_loader),
+            print(batch_idx, len(test_loader),
                          'Loss: %.3f | Acc: %.3f%% (%d/%d)'
                          % (test_loss/(batch_idx+1), 100.*correct/total, correct, total))
 
     return test_loss / batch_idx, 100. * correct / total
 
 
-def save_checkpoint(acc, epoch, model, model_name):
+def save_checkpoint(acc, epoch, model):
     print('=====> Saving checkpoint...')
     state = {
-        'model': model_name,
+        'model': args.model,
         'acc': acc,
         'state_dict': model.state_dict(),
         'epoch': epoch,
@@ -338,18 +335,64 @@ def adjust_lr(optimizer, epoch):
     if epoch >= 50:
         lr /= 10
     if epoch >= 100:
-        lr /= 10
+        lr /= 20
     if epoch >= 150:
-        lr /= 10
+        lr /= 40
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
+
+
+def attack_foolbox(RecosNet_model, test_loader):
+    fmodel = foolbox.models.PyTorchModel(RecosNet_model, bounds=(0, 1), num_classes=10, preprocessing=(0, 1))
+    attack_criteria = foolbox.criteria.Misclassification()
+    attack = foolbox.attacks.ProjectedGradientDescentAttack(model=fmodel, criterion=attack_criteria)
+
+    correct = 0
+    for batch_idx, (inputs, targets) in enumerate(test_loader):
+        inputs, targets = inputs.cpu().numpy()[0], int(targets.cpu().numpy())
+
+        adversarial = attack(inputs.astype(np.float32), targets, epsilon=config['epsilon'],
+                             stepsize=config['step_size'], iterations=config['num_steps'])
+
+        if adversarial is None:
+            adversarial = inputs.astype(np.float32)
+
+        if np.argmax(fmodel.predictions(adversarial)) == targets:
+            correct += 1.
+
+        sys.stdout.write("\rWhite-box attack (toolbox)... Acc: %.3f%% (%d/%d)" %
+                         (100. * correct / (batch_idx + 1), correct, batch_idx + 1))
+        sys.stdout.flush()
+
+    return 100. * correct / batch_idx
+
+
+def attack_pgd(net, test_loader):
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for batch_idx, (inputs, targets) in enumerate(test_loader):
+            inputs, targets = inputs.to(device), targets.to(device)
+
+            with torch.no_grad():
+                outputs, pert_inputs = net(inputs, targets)
+
+            _, pred_idx = torch.max(outputs.data, 1)
+            total += targets.size(0)
+            correct += pred_idx.eq(targets.data).cpu().sum().float()
+
+            sys.stdout.write("\rWhite-box pgd attack... Acc: %.3f%% (%d/%d)"
+                             % (100. * correct / total, correct, total))
+            sys.stdout.flush()
+
+    return 100. * correct / total
 
 
 if __name__ == '__main__':
 
     # Data
     print('=====> Preparing data...')
-
+    #
     transform_train = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
@@ -382,36 +425,10 @@ if __name__ == '__main__':
 
     # Models
     print('=====> Building model...')
-    if args.model == 'cbam-vgg16':
-        model = CBAM_VGG16()
-    elif args.model == 'cbam-vgg19':
-        model = CBAM_VGG19()
-    elif args.model == 'ram-vgg16':
+    if args.model == 'ram-vgg16':
         model = RAM_VGG16()
-    elif args.model == 'ram-vgg19':
-        model = RAM_VGG19()
-    elif args.model == 'ram-vgg16_v2':
+    elif args.model == 'ram-vgg16-v2':
         model = RAM_VGG16_v2()
-    elif args.model == 'ram_vgg19_v2':
-        model = RAM_VGG19_v2()
-    elif args.model == 'ltpa-vgg16':
-        model = LTPA_VGG16()
-    elif args.model == 'ltpa-vgg19':
-        model = LTPA_VGG19()
-    elif args.model == 'cbam-resnet':
-        model = CBAM_ResidualNet("CIFAR10", 18, 10)
-    elif args.model == 'ram-resnet':
-        model = RAM_ResNet18()
-    elif args.model == 'ram-resnet-v2':
-        model = RAM_ResNet18_v2()
-    elif args.model == 'ltpa-resnet':
-        model = LTPA_ResNet18()
-    elif args.model == 'vgg16':
-        model = M.vgg16(pretrained=False)
-    elif args.model == 'vgg19':
-        model = M.vgg19(pretrained=False)
-    elif args.model == 'resnet':
-        model = M.resnet18(pretrained=False)
     else:
         raise Exception('Unsupported Model')
 
@@ -419,22 +436,15 @@ if __name__ == '__main__':
     RecosNet_model = RecosNet(model)
     net = AttackPGD(RecosNet_model, config)
 
-    if args.resume:
-        print('=====> Resuming from checkpoint...')
-        assert os.path.isdir('checkpoint'), 'Error: no checkpoint directory found!'
-        checkpoint = torch.load(args.save_dir + args.name + '_epoch' + str(50) + '.ckpt')
-
-        model = checkpoint['model']
-        acc = checkpoint['acc']
-        START_EPOCH = checkpoint['epoch'] + 1
-        rng_state = checkpoint['rng_state']
-        checked_state = checkpoint['state_dict']
-        model.load_state_dict(checked_state)
-        torch.set_rng_state(rng_state)
-
     if torch.cuda.device_count() > 1:
         print("=====> Use", torch.cuda.device_count(), "GPUs")
         net = nn.DataParallel(net)
+
+    if args.resume:
+        check_info = torch.load(args.save_dir + args.name + '_epoch' + str(110) + '.ckpt')
+        START_EPOCH = check_info['epoch']
+        net.load_state_dict(check_info['state_dict'])
+        torch.set_rng_state(check_info['rng_state'])
 
     if not os.path.isdir('results'):
         os.mkdir('results')
@@ -444,18 +454,8 @@ if __name__ == '__main__':
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.decay)
 
-    if not os.path.exists(logname):
-        with open(logname, 'w') as logfile:
-            logwriter = csv.writer(logfile, delimiter=',')
-            logwriter.writerow(['Epoch', 'Train Loss', 'Train Acc', 'Test Loss', 'Test Acc'])
+    RecosNet_model.eval()
+    net.eval()
 
-    for epoch in range(START_EPOCH, args.epoch):
-        train_loss, train_acc = train(epoch, train_loader)
-        test_loss, test_acc = test(epoch, test_loader)
-        adjust_lr(optimizer, epoch)
-        with open(logname, 'a') as logfile:
-            logwriter = csv.writer(logfile, delimiter=',')
-            logwriter.writerow([epoch, train_loss, train_acc, test_loss, test_acc])
-
-        if epoch % args.num_ckpt_steps == 0:
-            save_checkpoint(test_acc, epoch, net, args.model)
+    print('=====> White-box pgd on trained model... Acc: %.3f%%' % attack_pgd(net, test_loader))
+    print('=====> White-box foolbox on trained model... Acc: %.3f%%' % attack_foolbox(RecosNet_model, test_loader))

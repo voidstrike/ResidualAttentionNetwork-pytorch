@@ -1,4 +1,5 @@
 from torch import nn
+from torch.nn import functional as func
 from .basic_layers import ResidualBlock, ChannelGate, SpatialGate
 
 
@@ -64,7 +65,9 @@ class residual_attn_module_v2(nn.Module):
         self.mp2 = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         self.mid = nn.Sequential(
             nn.Conv2d(in_channel, out_channel, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.Conv2d(in_channel, out_channel, kernel_size=3, stride=1, padding=1, bias=False)
+            nn.ReLU(True),
+            nn.Conv2d(in_channel, out_channel, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.ReLU(True)
         )
         self.i2 = nn.UpsamplingBilinear2d(size=s2)
 
@@ -88,12 +91,12 @@ class residual_attn_module_v2(nn.Module):
     # the output of this module will be passed to (1 + M(x)) * T(x), then passing to next conv layer
     def forward(self, x):
         out = self.mp1(x)
-        out = self.d1(out)
-        skip1 = self.skip1(out)
+        out = func.relu(self.d1(out))
+        skip1 = func.relu(self.skip1(out))
         out = self.mp2(out)
         out = self.mid(out)
         out = self.i2(out) + skip1
-        out = self.u2(out)
+        out = func.relu(self.u2(out))
         out = self.i1(out)
         out = self.last(out)
 
